@@ -1,6 +1,7 @@
 from __future__ import annotations as _annotations
 
 import base64
+import json
 import re
 from collections.abc import AsyncIterator, Awaitable
 from contextlib import asynccontextmanager
@@ -36,11 +37,15 @@ from ..messages import (
     ModelResponse,
     ModelResponsePart,
     ModelResponseStreamEvent,
+    PartDeltaEvent,
+    PartEndEvent,
+    PartStartEvent,
     RetryPromptPart,
     SystemPromptPart,
     TextPart,
     ThinkingPart,
     ToolCallPart,
+    ToolCallPartDelta,
     ToolReturnPart,
     UserPromptPart,
     VideoUrl,
@@ -62,6 +67,7 @@ from . import (
 try:
     from google.genai import Client, errors
     from google.genai.types import (
+        AutomaticFunctionCallingConfigDict,
         BlobDict,
         CodeExecutionResult,
         CodeExecutionResultDict,
@@ -546,6 +552,9 @@ class GoogleModel(Model):
             else:
                 raise UserError('Google does not support setting ModelSettings.timeout to a httpx.Timeout')
 
+        stream_args = model_settings.get('google_stream_function_call_arguments', False)
+        afc_config = AutomaticFunctionCallingConfigDict(disable=True) if stream_args else None
+
         config = GenerateContentConfigDict(
             http_options=http_options,
             system_instruction=system_instruction,
@@ -567,6 +576,7 @@ class GoogleModel(Model):
             response_json_schema=response_schema,
             response_modalities=modalities,
             image_config=image_config,
+            automatic_function_calling=afc_config,
         )
 
         return contents, config
@@ -772,7 +782,12 @@ class GeminiStreamedResponse(StreamedResponse):
     _timestamp: datetime = field(default_factory=_utils.now_utc)
     _file_search_tool_call_id: str | None = field(default=None, init=False)
     _code_execution_tool_call_id: str | None = field(default=None, init=False)
+    _streaming_fc_name: str | None = field(default=None, init=False)
+    _streaming_fc_id: str | None = field(default=None, init=False)
     _streaming_fc_args: dict[str, Any] = field(default_factory=dict, init=False)
+    _streaming_fc_provider_details: dict[str, Any] | None = field(default=None, init=False)
+    _streaming_fc_emitted_start: bool = field(default=False, init=False)
+    _streaming_fc_last_json: str = field(default='', init=False)
 
     async def _get_event_iterator(self) -> AsyncIterator[ModelResponseStreamEvent]:  # noqa: C901
         if self._provider_timestamp is not None:
@@ -853,34 +868,90 @@ class GeminiStreamedResponse(StreamedResponse):
                             yield event
                 elif part.function_call:
                     fc = part.function_call
-                    vendor_part_id = fc.id or uuid4()
+
+                    if fc.name and not self._streaming_fc_name:
+                        self._streaming_fc_name = fc.name
+                        self._streaming_fc_id = fc.id or _utils.generate_tool_call_id()
+                        self._streaming_fc_provider_details = provider_details
+                        self._streaming_fc_emitted_start = False
+                        self._streaming_fc_last_json = ''
+
+                    if self._streaming_fc_name and self._streaming_fc_id and not self._streaming_fc_emitted_start:
+                        start_part = ToolCallPart(
+                            tool_name=self._streaming_fc_name,
+                            args={},
+                            tool_call_id=self._streaming_fc_id,
+                            provider_details=self._streaming_fc_provider_details,
+                        )
+                        yield PartStartEvent(index=0, part=start_part)
+                        self._streaming_fc_emitted_start = True
 
                     if fc.partial_args:
                         for pa in fc.partial_args:
                             if pa.json_path:
-                                value = pa.string_value or pa.number_value or pa.bool_value
-                                _set_nested_value(
-                                    self._streaming_fc_args,
-                                    pa.json_path,
-                                    value,
-                                    append=isinstance(value, str),
-                                )
-                        args_delta = dict(self._streaming_fc_args)
-                    else:
-                        args_delta = fc.args
+                                value = pa.string_value
+                                if value is None and pa.number_value is not None:
+                                    value = pa.number_value
+                                if value is None and pa.bool_value is not None:
+                                    value = pa.bool_value
+                                if value is not None:
+                                    _set_nested_value(
+                                        self._streaming_fc_args,
+                                        pa.json_path,
+                                        value,
+                                        append=isinstance(value, str),
+                                    )
+                                    current_json = json.dumps(self._streaming_fc_args)
+                                    if current_json != self._streaming_fc_last_json:
+                                        if self._streaming_fc_last_json:
+                                            delta = current_json[len(self._streaming_fc_last_json) :]
+                                            if delta:
+                                                yield PartDeltaEvent(
+                                                    index=0,
+                                                    delta=ToolCallPartDelta(tool_name_delta=None, args_delta=delta),
+                                                )
+                                        else:
+                                            yield PartDeltaEvent(
+                                                index=0,
+                                                delta=ToolCallPartDelta(tool_name_delta=None, args_delta=current_json),
+                                            )
+                                        self._streaming_fc_last_json = current_json
 
-                    maybe_event = self._parts_manager.handle_tool_call_delta(
-                        vendor_part_id=vendor_part_id,
-                        tool_name=fc.name,
-                        args=args_delta,
-                        tool_call_id=fc.id,
-                        provider_details=provider_details,
-                    )
-                    if maybe_event is not None:  # pragma: no branch
-                        yield maybe_event
+                    elif fc.args:
+                        self._streaming_fc_args = dict(fc.args)
+                        args_json = json.dumps(self._streaming_fc_args)
+                        yield PartDeltaEvent(
+                            index=0,
+                            delta=ToolCallPartDelta(tool_name_delta=None, args_delta=args_json),
+                        )
 
-                    if fc.will_continue is False:
-                        self._streaming_fc_args.clear()
+                    is_complete = fc.will_continue is False or fc.args is not None
+
+                    if is_complete and self._streaming_fc_name and self._streaming_fc_id:
+                        end_part = ToolCallPart(
+                            tool_name=self._streaming_fc_name,
+                            args=self._streaming_fc_args or {},
+                            tool_call_id=self._streaming_fc_id,
+                            provider_details=self._streaming_fc_provider_details,
+                        )
+                        yield PartEndEvent(index=0, part=end_part)
+
+                        maybe_event = self._parts_manager.handle_tool_call_delta(
+                            vendor_part_id=uuid4(),
+                            tool_name=self._streaming_fc_name,
+                            args=self._streaming_fc_args or {},
+                            tool_call_id=self._streaming_fc_id,
+                            provider_details=self._streaming_fc_provider_details,
+                        )
+                        if maybe_event is not None:
+                            yield maybe_event
+
+                        self._streaming_fc_name = None
+                        self._streaming_fc_id = None
+                        self._streaming_fc_args = {}
+                        self._streaming_fc_provider_details = None
+                        self._streaming_fc_emitted_start = False
+                        self._streaming_fc_last_json = ''
                 elif part.inline_data is not None:
                     if part.thought:  # pragma: no cover
                         # Per https://ai.google.dev/gemini-api/docs/image-generation#thinking-process:
