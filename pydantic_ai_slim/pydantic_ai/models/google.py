@@ -193,6 +193,16 @@ class GoogleModelSettings(ModelSettings, total=False):
     See <https://ai.google.dev/gemini-api/docs/caching> for more information.
     """
 
+    google_stream_function_call_arguments: bool
+    """Stream function call arguments token-by-token during streaming responses.
+
+    When enabled, function call arguments will be streamed incrementally as they are
+    generated, allowing for partial argument updates via `ToolCallPartDelta` events.
+
+    Only supported by Gemini 3+ models (e.g., gemini-3-flash-preview).
+    Defaults to False for backwards compatibility.
+    """
+
 
 @dataclass(init=False)
 class GoogleModel(Model):
@@ -440,7 +450,10 @@ class GoogleModel(Model):
         return tools or None, image_config
 
     def _get_tool_config(
-        self, model_request_parameters: ModelRequestParameters, tools: list[ToolDict] | None
+        self,
+        model_request_parameters: ModelRequestParameters,
+        tools: list[ToolDict] | None,
+        model_settings: GoogleModelSettings,
     ) -> ToolConfigDict | None:
         if not model_request_parameters.allow_text_output and tools:
             names: list[str] = []
@@ -448,7 +461,8 @@ class GoogleModel(Model):
                 for function_declaration in tool.get('function_declarations') or []:
                     if name := function_declaration.get('name'):  # pragma: no branch
                         names.append(name)
-            return _tool_config(names)
+            stream_args = model_settings.get('google_stream_function_call_arguments', False)
+            return _tool_config(names, stream_function_call_arguments=stream_args)
         else:
             return None
 
@@ -516,7 +530,7 @@ class GoogleModel(Model):
                 raise UserError('JSON output is not supported by this model.')
             response_mime_type = 'application/json'
 
-        tool_config = self._get_tool_config(model_request_parameters, tools)
+        tool_config = self._get_tool_config(model_request_parameters, tools, model_settings)
         system_instruction, contents = await self._map_messages(messages, model_request_parameters)
 
         modalities = [Modality.TEXT.value]
@@ -758,6 +772,7 @@ class GeminiStreamedResponse(StreamedResponse):
     _timestamp: datetime = field(default_factory=_utils.now_utc)
     _file_search_tool_call_id: str | None = field(default=None, init=False)
     _code_execution_tool_call_id: str | None = field(default=None, init=False)
+    _streaming_fc_args: dict[str, Any] = field(default_factory=dict, init=False)
 
     async def _get_event_iterator(self) -> AsyncIterator[ModelResponseStreamEvent]:  # noqa: C901
         if self._provider_timestamp is not None:
@@ -837,15 +852,35 @@ class GeminiStreamedResponse(StreamedResponse):
                         ):
                             yield event
                 elif part.function_call:
+                    fc = part.function_call
+                    vendor_part_id = fc.id or uuid4()
+
+                    if fc.partial_args:
+                        for pa in fc.partial_args:
+                            if pa.json_path:
+                                value = pa.string_value or pa.number_value or pa.bool_value
+                                _set_nested_value(
+                                    self._streaming_fc_args,
+                                    pa.json_path,
+                                    value,
+                                    append=isinstance(value, str),
+                                )
+                        args_delta = dict(self._streaming_fc_args)
+                    else:
+                        args_delta = fc.args
+
                     maybe_event = self._parts_manager.handle_tool_call_delta(
-                        vendor_part_id=uuid4(),
-                        tool_name=part.function_call.name,
-                        args=part.function_call.args,
-                        tool_call_id=part.function_call.id,
+                        vendor_part_id=vendor_part_id,
+                        tool_name=fc.name,
+                        args=args_delta,
+                        tool_call_id=fc.id,
                         provider_details=provider_details,
                     )
                     if maybe_event is not None:  # pragma: no branch
                         yield maybe_event
+
+                    if fc.will_continue is False:
+                        self._streaming_fc_args.clear()
                 elif part.inline_data is not None:
                     if part.thought:  # pragma: no cover
                         # Per https://ai.google.dev/gemini-api/docs/image-generation#thinking-process:
@@ -1127,9 +1162,68 @@ def _function_declaration_from_tool(tool: ToolDefinition) -> FunctionDeclaration
     return f
 
 
-def _tool_config(function_names: list[str]) -> ToolConfigDict:
+def _parse_json_path(path: str) -> list[str | int]:
+    """Parse a JSONPath-like string into a list of keys/indices."""
+    if path.startswith('$.'):
+        path = path[2:]
+
+    parts: list[str | int] = []
+    i = 0
+    while i < len(path):
+        if path[i] == '[':
+            end = path.index(']', i)
+            parts.append(int(path[i + 1 : end]))
+            i = end + 1
+            if i < len(path) and path[i] == '.':
+                i += 1
+        elif path[i] == '.':
+            i += 1
+        else:
+            end = len(path)
+            for delim in ('.', '['):
+                if (idx := path.find(delim, i)) != -1 and idx < end:
+                    end = idx
+            parts.append(path[i:end])
+            i = end
+    return parts
+
+
+def _set_nested_value(obj: dict[str, Any], path: str, value: Any, *, append: bool = False) -> None:
+    """Set a value in a nested dict using a JSONPath-like string (e.g., 'items[0].name')."""
+    parts = _parse_json_path(path)
+    current: Any = obj
+
+    for j, part in enumerate(parts[:-1]):
+        if isinstance(part, int):
+            while len(current) <= part:
+                current.append({})
+            if current[part] is None:
+                current[part] = {}
+            current = current[part]
+        else:
+            next_part = parts[j + 1]
+            if part not in current or current[part] is None:
+                current[part] = [] if isinstance(next_part, int) else {}
+            current = current[part]
+
+    last_part = parts[-1]
+    if isinstance(last_part, int):
+        while len(current) <= last_part:
+            current.append(None)
+        existing = current[last_part]
+        current[last_part] = existing + value if append and existing is not None else value
+    else:
+        existing = current.get(last_part)
+        current[last_part] = existing + value if append and existing is not None else value
+
+
+def _tool_config(function_names: list[str], *, stream_function_call_arguments: bool = False) -> ToolConfigDict:
     mode = FunctionCallingConfigMode.ANY
-    function_calling_config = FunctionCallingConfigDict(mode=mode, allowed_function_names=function_names)
+    function_calling_config = FunctionCallingConfigDict(
+        mode=mode,
+        allowed_function_names=function_names,
+        stream_function_call_arguments=stream_function_call_arguments or None,
+    )
     return ToolConfigDict(function_calling_config=function_calling_config)
 
 
