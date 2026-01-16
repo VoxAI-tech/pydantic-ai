@@ -788,6 +788,7 @@ class GeminiStreamedResponse(StreamedResponse):
     _streaming_fc_provider_details: dict[str, Any] | None = field(default=None, init=False)
     _streaming_fc_emitted_start: bool = field(default=False, init=False)
     _streaming_fc_last_json: str = field(default='', init=False)
+    _streaming_fc_continuing_paths: set[str] = field(default_factory=set, init=False)
 
     async def _get_event_iterator(self) -> AsyncIterator[ModelResponseStreamEvent]:  # noqa: C901
         if self._provider_timestamp is not None:
@@ -895,12 +896,20 @@ class GeminiStreamedResponse(StreamedResponse):
                                 if value is None and pa.bool_value is not None:
                                     value = pa.bool_value
                                 if value is not None:
+                                    should_append = (
+                                        isinstance(value, str)
+                                        and pa.json_path in self._streaming_fc_continuing_paths
+                                    )
                                     _set_nested_value(
                                         self._streaming_fc_args,
                                         pa.json_path,
                                         value,
-                                        append=isinstance(value, str),
+                                        append=should_append,
                                     )
+                                    if pa.will_continue is True:
+                                        self._streaming_fc_continuing_paths.add(pa.json_path)
+                                    else:
+                                        self._streaming_fc_continuing_paths.discard(pa.json_path)
                                     current_json = json.dumps(self._streaming_fc_args)
                                     if current_json != self._streaming_fc_last_json:
                                         if self._streaming_fc_last_json:
@@ -952,6 +961,7 @@ class GeminiStreamedResponse(StreamedResponse):
                         self._streaming_fc_provider_details = None
                         self._streaming_fc_emitted_start = False
                         self._streaming_fc_last_json = ''
+                        self._streaming_fc_continuing_paths = set()
                 elif part.inline_data is not None:
                     if part.thought:  # pragma: no cover
                         # Per https://ai.google.dev/gemini-api/docs/image-generation#thinking-process:
