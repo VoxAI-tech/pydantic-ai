@@ -912,18 +912,10 @@ class GeminiStreamedResponse(StreamedResponse):
                                         self._streaming_fc_continuing_paths.discard(pa.json_path)
                                     current_json = json.dumps(self._streaming_fc_args)
                                     if current_json != self._streaming_fc_last_json:
-                                        if self._streaming_fc_last_json:
-                                            delta = current_json[len(self._streaming_fc_last_json) :]
-                                            if delta:
-                                                yield PartDeltaEvent(
-                                                    index=0,
-                                                    delta=ToolCallPartDelta(tool_name_delta=None, args_delta=delta),
-                                                )
-                                        else:
-                                            yield PartDeltaEvent(
-                                                index=0,
-                                                delta=ToolCallPartDelta(tool_name_delta=None, args_delta=current_json),
-                                            )
+                                        yield PartDeltaEvent(
+                                            index=0,
+                                            delta=ToolCallPartDelta(tool_name_delta=None, args_delta=current_json),
+                                        )
                                         self._streaming_fc_last_json = current_json
 
                     elif fc.args:
