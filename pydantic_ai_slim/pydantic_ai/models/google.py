@@ -984,6 +984,18 @@ class GeminiStreamedResponse(StreamedResponse):
             if file_search_part is not None:
                 yield self._parts_manager.handle_part(vendor_part_id=uuid4(), part=file_search_part)
 
+        # Fallback: register streaming function call if it never got an explicit completion signal
+        if self._streaming_fc_name and self._streaming_fc_id:
+            maybe_event = self._parts_manager.handle_tool_call_delta(
+                vendor_part_id=uuid4(),
+                tool_name=self._streaming_fc_name,
+                args=self._streaming_fc_args or {},
+                tool_call_id=self._streaming_fc_id,
+                provider_details=self._streaming_fc_provider_details,
+            )
+            if maybe_event is not None:
+                yield maybe_event
+
     def _handle_file_search_grounding_metadata_streaming(
         self, grounding_metadata: GroundingMetadata | None
     ) -> BuiltinToolReturnPart | None:
