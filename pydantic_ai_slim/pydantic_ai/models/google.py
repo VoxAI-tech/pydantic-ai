@@ -38,7 +38,6 @@ from ..messages import (
     ModelResponsePart,
     ModelResponseStreamEvent,
     PartDeltaEvent,
-    PartEndEvent,
     PartStartEvent,
     RetryPromptPart,
     SystemPromptPart,
@@ -112,6 +111,26 @@ except ImportError as _import_error:
 
 
 _FILE_SEARCH_QUERY_PATTERN = re.compile(r'file_search\.query\(query=(["\'])((?:\\.|(?!\1).)*?)\1\)')
+
+
+@dataclass
+class _StreamingFC:
+    """Per-tool-call state for streaming function calls.
+
+    Tracks the state of a single function call during streaming, enabling
+    support for parallel tool calls where multiple function calls may be
+    streamed simultaneously.
+    """
+
+    name: str
+    id: str
+    index: int
+    args: dict[str, Any] = field(default_factory=dict)
+    provider_details: dict[str, Any] | None = None
+    emitted_start: bool = False
+    emitted_end: bool = False
+    last_json: str = ''
+    continuing_paths: set[str] = field(default_factory=set)
 
 
 LatestGoogleModelNames = Literal[
@@ -782,13 +801,8 @@ class GeminiStreamedResponse(StreamedResponse):
     _timestamp: datetime = field(default_factory=_utils.now_utc)
     _file_search_tool_call_id: str | None = field(default=None, init=False)
     _code_execution_tool_call_id: str | None = field(default=None, init=False)
-    _streaming_fc_name: str | None = field(default=None, init=False)
-    _streaming_fc_id: str | None = field(default=None, init=False)
-    _streaming_fc_args: dict[str, Any] = field(default_factory=dict, init=False)
-    _streaming_fc_provider_details: dict[str, Any] | None = field(default=None, init=False)
-    _streaming_fc_emitted_start: bool = field(default=False, init=False)
-    _streaming_fc_last_json: str = field(default='', init=False)
-    _streaming_fc_continuing_paths: set[str] = field(default_factory=set, init=False)
+    _streaming_fcs: dict[str, _StreamingFC] = field(default_factory=dict, init=False)
+    _next_streaming_fc_index: int = field(default=0, init=False)
 
     async def _get_event_iterator(self) -> AsyncIterator[ModelResponseStreamEvent]:  # noqa: C901
         if self._provider_timestamp is not None:
@@ -870,22 +884,57 @@ class GeminiStreamedResponse(StreamedResponse):
                 elif part.function_call:
                     fc = part.function_call
 
-                    if fc.name and not self._streaming_fc_name:
-                        self._streaming_fc_name = fc.name
-                        self._streaming_fc_id = fc.id or _utils.generate_tool_call_id()
-                        self._streaming_fc_provider_details = provider_details
-                        self._streaming_fc_emitted_start = False
-                        self._streaming_fc_last_json = ''
+                    # Determine the tracking key for this function call
+                    # If Gemini provides an id, use it; otherwise, find existing entry by name
+                    # or create a new one
+                    fc_id: str | None = fc.id
+                    sfc: _StreamingFC | None = None
 
-                    if self._streaming_fc_name and self._streaming_fc_id and not self._streaming_fc_emitted_start:
-                        start_part = ToolCallPart(
-                            tool_name=self._streaming_fc_name,
-                            args={},
-                            tool_call_id=self._streaming_fc_id,
-                            provider_details=self._streaming_fc_provider_details,
+                    if fc_id and fc_id in self._streaming_fcs:
+                        # Existing entry with matching id
+                        sfc = self._streaming_fcs[fc_id]
+                    elif fc_id is None and fc.name:
+                        # No id provided - look for existing entry by name
+                        for existing_id, existing_sfc in self._streaming_fcs.items():
+                            if existing_sfc.name == fc.name:
+                                fc_id = existing_id
+                                sfc = existing_sfc
+                                break
+
+                    # Skip processing if this tool call has already been completed
+                    if sfc is not None and sfc.emitted_end:
+                        continue
+
+                    # Create new entry if no existing match found
+                    if sfc is None and fc.name:
+                        fc_id = fc.id or _utils.generate_tool_call_id()
+                        # For non-streaming function calls, args may already be complete
+                        initial_args = dict(fc.args) if fc.args else {}
+                        sfc = _StreamingFC(
+                            name=fc.name,
+                            id=fc_id,
+                            index=self._next_streaming_fc_index,
+                            args=initial_args,
+                            provider_details=provider_details,
                         )
-                        yield PartStartEvent(index=0, part=start_part)
-                        self._streaming_fc_emitted_start = True
+                        self._streaming_fcs[fc_id] = sfc
+                        self._next_streaming_fc_index += 1
+
+                    if sfc is None or fc_id is None:
+                        continue
+
+                    # Emit start event if not yet emitted
+                    if not sfc.emitted_start:
+                        start_part = ToolCallPart(
+                            tool_name=sfc.name,
+                            args=sfc.args,
+                            tool_call_id=sfc.id,
+                            provider_details=sfc.provider_details,
+                        )
+                        yield PartStartEvent(index=sfc.index, part=start_part)
+                        sfc.emitted_start = True
+                        if sfc.args:
+                            sfc.last_json = json.dumps(sfc.args)
 
                     if fc.partial_args:
                         for pa in fc.partial_args:
@@ -896,64 +945,49 @@ class GeminiStreamedResponse(StreamedResponse):
                                 if value is None and pa.bool_value is not None:
                                     value = pa.bool_value
                                 if value is not None:
-                                    should_append = (
-                                        isinstance(value, str)
-                                        and pa.json_path in self._streaming_fc_continuing_paths
-                                    )
+                                    should_append = isinstance(value, str) and pa.json_path in sfc.continuing_paths
                                     _set_nested_value(
-                                        self._streaming_fc_args,
+                                        sfc.args,
                                         pa.json_path,
                                         value,
                                         append=should_append,
                                     )
                                     if pa.will_continue is True:
-                                        self._streaming_fc_continuing_paths.add(pa.json_path)
+                                        sfc.continuing_paths.add(pa.json_path)
                                     else:
-                                        self._streaming_fc_continuing_paths.discard(pa.json_path)
-                                    current_json = json.dumps(self._streaming_fc_args)
-                                    if current_json != self._streaming_fc_last_json:
+                                        sfc.continuing_paths.discard(pa.json_path)
+                                    current_json = json.dumps(sfc.args)
+                                    if current_json != sfc.last_json:
                                         yield PartDeltaEvent(
-                                            index=0,
+                                            index=sfc.index,
                                             delta=ToolCallPartDelta(tool_name_delta=None, args_delta=current_json),
                                         )
-                                        self._streaming_fc_last_json = current_json
+                                        sfc.last_json = current_json
 
                     elif fc.args:
-                        self._streaming_fc_args = dict(fc.args)
-                        args_json = json.dumps(self._streaming_fc_args)
-                        yield PartDeltaEvent(
-                            index=0,
-                            delta=ToolCallPartDelta(tool_name_delta=None, args_delta=args_json),
-                        )
+                        sfc.args = dict(fc.args)
+                        args_json = json.dumps(sfc.args)
+                        # Only emit delta if args have changed (skip for non-streaming case)
+                        if args_json != sfc.last_json:
+                            yield PartDeltaEvent(
+                                index=sfc.index,
+                                delta=ToolCallPartDelta(tool_name_delta=None, args_delta=args_json),
+                            )
+                            sfc.last_json = args_json
 
                     is_complete = fc.will_continue is False or fc.args is not None
 
-                    if is_complete and self._streaming_fc_name and self._streaming_fc_id:
-                        end_part = ToolCallPart(
-                            tool_name=self._streaming_fc_name,
-                            args=self._streaming_fc_args or {},
-                            tool_call_id=self._streaming_fc_id,
-                            provider_details=self._streaming_fc_provider_details,
+                    if is_complete and not sfc.emitted_end:
+                        sfc.emitted_end = True
+                        # Register with _parts_manager for internal tracking
+                        # Don't manually emit PartEndEvent - the base wrapper handles it
+                        self._parts_manager.handle_tool_call_delta(
+                            vendor_part_id=fc_id,
+                            tool_name=sfc.name,
+                            args=sfc.args or {},
+                            tool_call_id=sfc.id,
+                            provider_details=sfc.provider_details,
                         )
-                        yield PartEndEvent(index=0, part=end_part)
-
-                        maybe_event = self._parts_manager.handle_tool_call_delta(
-                            vendor_part_id=uuid4(),
-                            tool_name=self._streaming_fc_name,
-                            args=self._streaming_fc_args or {},
-                            tool_call_id=self._streaming_fc_id,
-                            provider_details=self._streaming_fc_provider_details,
-                        )
-                        if maybe_event is not None:
-                            yield maybe_event
-
-                        self._streaming_fc_name = None
-                        self._streaming_fc_id = None
-                        self._streaming_fc_args = {}
-                        self._streaming_fc_provider_details = None
-                        self._streaming_fc_emitted_start = False
-                        self._streaming_fc_last_json = ''
-                        self._streaming_fc_continuing_paths = set()
                 elif part.inline_data is not None:
                     if part.thought:  # pragma: no cover
                         # Per https://ai.google.dev/gemini-api/docs/image-generation#thinking-process:
@@ -986,17 +1020,19 @@ class GeminiStreamedResponse(StreamedResponse):
             if file_search_part is not None:
                 yield self._parts_manager.handle_part(vendor_part_id=uuid4(), part=file_search_part)
 
-        # Fallback: register streaming function call if it never got an explicit completion signal
-        if self._streaming_fc_name and self._streaming_fc_id:
-            maybe_event = self._parts_manager.handle_tool_call_delta(
-                vendor_part_id=uuid4(),
-                tool_name=self._streaming_fc_name,
-                args=self._streaming_fc_args or {},
-                tool_call_id=self._streaming_fc_id,
-                provider_details=self._streaming_fc_provider_details,
-            )
-            if maybe_event is not None:
-                yield maybe_event
+        # Fallback: register any streaming function calls that never got explicit completion signals
+        # Don't manually emit PartEndEvent - the base wrapper handles it
+        for fc_id, sfc in list(self._streaming_fcs.items()):
+            if sfc.emitted_start and not sfc.emitted_end:
+                # Register with _parts_manager for internal tracking
+                self._parts_manager.handle_tool_call_delta(
+                    vendor_part_id=fc_id,
+                    tool_name=sfc.name,
+                    args=sfc.args or {},
+                    tool_call_id=sfc.id,
+                    provider_details=sfc.provider_details,
+                )
+        self._streaming_fcs.clear()
 
     def _handle_file_search_grounding_metadata_streaming(
         self, grounding_metadata: GroundingMetadata | None
