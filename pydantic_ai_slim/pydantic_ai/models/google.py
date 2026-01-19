@@ -37,14 +37,11 @@ from ..messages import (
     ModelResponse,
     ModelResponsePart,
     ModelResponseStreamEvent,
-    PartDeltaEvent,
-    PartStartEvent,
     RetryPromptPart,
     SystemPromptPart,
     TextPart,
     ThinkingPart,
     ToolCallPart,
-    ToolCallPartDelta,
     ToolReturnPart,
     UserPromptPart,
     VideoUrl,
@@ -127,6 +124,7 @@ class _StreamingFC:
     index: int
     args: dict[str, Any] = field(default_factory=dict)
     provider_details: dict[str, Any] | None = None
+    registered: bool = False  # Whether we've registered with _parts_manager
     emitted_start: bool = False
     emitted_end: bool = False
     last_json: str = ''
@@ -896,7 +894,15 @@ class GeminiStreamedResponse(StreamedResponse):
                     elif fc_id is None and fc.name:
                         # No id provided - look for existing entry by name
                         for existing_id, existing_sfc in self._streaming_fcs.items():
-                            if existing_sfc.name == fc.name:
+                            if existing_sfc.name == fc.name and not existing_sfc.emitted_end:
+                                fc_id = existing_id
+                                sfc = existing_sfc
+                                break
+                    elif fc_id is None and fc.name is None:
+                        # Continuation or completion chunk with no id/name - match to most recent incomplete sfc
+                        # This handles both partial_args streaming AND final completion (partial_args=False, will_continue=None)
+                        for existing_id, existing_sfc in self._streaming_fcs.items():
+                            if not existing_sfc.emitted_end:
                                 fc_id = existing_id
                                 sfc = existing_sfc
                                 break
@@ -923,19 +929,7 @@ class GeminiStreamedResponse(StreamedResponse):
                     if sfc is None or fc_id is None:
                         continue
 
-                    # Emit start event if not yet emitted
-                    if not sfc.emitted_start:
-                        start_part = ToolCallPart(
-                            tool_name=sfc.name,
-                            args=sfc.args,
-                            tool_call_id=sfc.id,
-                            provider_details=sfc.provider_details,
-                        )
-                        yield PartStartEvent(index=sfc.index, part=start_part)
-                        sfc.emitted_start = True
-                        if sfc.args:
-                            sfc.last_json = json.dumps(sfc.args)
-
+                    # Process partial_args (streaming) to accumulate args
                     if fc.partial_args:
                         for pa in fc.partial_args:
                             if pa.json_path:
@@ -956,38 +950,38 @@ class GeminiStreamedResponse(StreamedResponse):
                                         sfc.continuing_paths.add(pa.json_path)
                                     else:
                                         sfc.continuing_paths.discard(pa.json_path)
-                                    current_json = json.dumps(sfc.args)
-                                    if current_json != sfc.last_json:
-                                        yield PartDeltaEvent(
-                                            index=sfc.index,
-                                            delta=ToolCallPartDelta(tool_name_delta=None, args_delta=current_json),
-                                        )
-                                        sfc.last_json = current_json
-
                     elif fc.args:
                         sfc.args = dict(fc.args)
-                        args_json = json.dumps(sfc.args)
-                        # Only emit delta if args have changed (skip for non-streaming case)
-                        if args_json != sfc.last_json:
-                            yield PartDeltaEvent(
-                                index=sfc.index,
-                                delta=ToolCallPartDelta(tool_name_delta=None, args_delta=args_json),
-                            )
-                            sfc.last_json = args_json
 
-                    is_complete = fc.will_continue is False or fc.args is not None
-
-                    if is_complete and not sfc.emitted_end:
-                        sfc.emitted_end = True
-                        # Register with _parts_manager for internal tracking
-                        # Don't manually emit PartEndEvent - the base wrapper handles it
-                        self._parts_manager.handle_tool_call_delta(
+                    # Use _parts_manager for ALL events (start, delta, tracking)
+                    # This ensures _parts_manager stays in sync for the base wrapper
+                    current_json = json.dumps(sfc.args) if sfc.args else ''
+                    if current_json != sfc.last_json or not sfc.registered:
+                        # Only pass tool_name on first registration to avoid duplication
+                        # (tool_name_delta gets appended in _parts_manager)
+                        tool_name_to_pass = sfc.name if not sfc.registered else None
+                        maybe_event = self._parts_manager.handle_tool_call_delta(
                             vendor_part_id=fc_id,
-                            tool_name=sfc.name,
-                            args=sfc.args or {},
-                            tool_call_id=sfc.id,
-                            provider_details=sfc.provider_details,
+                            tool_name=tool_name_to_pass,
+                            args=sfc.args,
+                            tool_call_id=sfc.id if not sfc.registered else None,
+                            provider_details=sfc.provider_details if not sfc.registered else None,
                         )
+                        sfc.registered = True  # Mark as registered regardless of event
+                        if maybe_event is not None:
+                            yield maybe_event
+                            sfc.emitted_start = True
+                        sfc.last_json = current_json
+
+                    # Mark as complete when: explicit will_continue=False, has complete args,
+                    # or streaming ended (will_continue=None with no partial_args)
+                    is_complete = (
+                        fc.will_continue is False
+                        or fc.args is not None
+                        or (fc.will_continue is None and not fc.partial_args)
+                    )
+                    if is_complete:
+                        sfc.emitted_end = True
                 elif part.inline_data is not None:
                     if part.thought:  # pragma: no cover
                         # Per https://ai.google.dev/gemini-api/docs/image-generation#thinking-process:
@@ -1024,13 +1018,14 @@ class GeminiStreamedResponse(StreamedResponse):
         # Don't manually emit PartEndEvent - the base wrapper handles it
         for fc_id, sfc in list(self._streaming_fcs.items()):
             if sfc.emitted_start and not sfc.emitted_end:
-                # Register with _parts_manager for internal tracking
+                # Only update args - don't pass tool_name again to avoid duplication
+                # (sfc.registered=True means it was already registered with _parts_manager)
                 self._parts_manager.handle_tool_call_delta(
                     vendor_part_id=fc_id,
-                    tool_name=sfc.name,
+                    tool_name=None if sfc.registered else sfc.name,
                     args=sfc.args or {},
-                    tool_call_id=sfc.id,
-                    provider_details=sfc.provider_details,
+                    tool_call_id=None if sfc.registered else sfc.id,
+                    provider_details=None if sfc.registered else sfc.provider_details,
                 )
         self._streaming_fcs.clear()
 
